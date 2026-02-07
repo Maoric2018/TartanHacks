@@ -9,6 +9,12 @@ const outPath = path.join(root, 'dist', 'neon-phases.min.html');
 
 const html = fs.readFileSync(srcPath, 'utf8');
 
+function stripDevBlocks(doc) {
+  return doc
+    .replace(/<!--DEBUG_BOSS_MENU_START-->[\s\S]*?<!--DEBUG_BOSS_MENU_END-->/g, '')
+    .replace(/\/\*DEBUG_BOSS_MENU_START\*\/[\s\S]*?\/\*DEBUG_BOSS_MENU_END\*\//g, '');
+}
+
 function minifyCss(css) {
   return css
     .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -70,6 +76,126 @@ function escapeScriptClose(js) {
   return js.replace(/<\/script>/gi, '<\\/script>');
 }
 
+const INTERNAL_PROP_KEYS = [
+  'moveParams', 'spawnTime', 'bossEntity', 'waveState', 'bannerTimer', 'killFlash',
+  'swordIFrame', 'pulseSpeed', 'difficulty', 'shieldNodes', 'bossAI', 'isBoss',
+  'firePattern', 'fireTimer', 'fireCD', 'maxLife', 'maxHp', 'hitFlash', 'moveType',
+  'spiralAngle', 'waveBannerTimer', 'waveBannerText', 'waveBannerSub', 'waveModTimer',
+  'waveModText', 'levelUpQueue', 'xpToNext', 'totalKills', '_bossModQueue',
+  '_bossSpawnPending', 'gameOverFade', '_bossLaserHitCD', '_dashInvuln', '_dashTele',
+  '_warpTele', '_portals', '_drones', '_ghosts', '_upgradeTransition', '_staticFields',
+  '_shurikens', '_rocketRings', '_posHistory', '_checkT', 'waveKills', 'waveQuota',
+  'bannerText', 'bannerColor', 'pulseTimer', 'moveSpeed', 'dodgeChance', 'regenTimer',
+  'regenInterval', 'shieldRecharge', 'cdReduction', 'critChance', 'critMult', 'passives',
+  'fireParams', 'bossWindX', 'bossWindY', 'chargeTime', 'maxCharge', 'weaponId',
+  'passiveId', 'lungeDir', 'lungeTimer', 'lungeProg', 'lungeStartX', 'lungeStartY',
+  'lungeDist', 'warpTimer', 'summonTimer', 'shieldUp', 'bossFxPower', 'bossFxFreq',
+  'bossFxPhase', 'bossFxSpin', 'laserSpin', 'attackIdx', 'linkBeam', 'linkTimer',
+  '_twinIdx', '_twinPartner', '_aftershockEnd', '_swordAfterT', '_swordHitT',
+  '_arcTimer', '_dashStrike', '_targets', '_zigzags', '_homingDelay', 'bossFx',
+  'shieldHP', 'wavePhaseIdx', 'freezeTimer', 'reverseTimer', 'reverseCD', 'reflect',
+  'gravity', 'windX', 'windY', 'reversed', 'frozen'
+];
+const MANGLE_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_';
+
+function countWord(js, word) {
+  const m = js.match(new RegExp(`\\b${word}\\b`, 'g'));
+  return m ? m.length : 0;
+}
+
+function shortToken(i) {
+  let n = i;
+  let out = '';
+  do {
+    out = MANGLE_CHARS[n % MANGLE_CHARS.length] + out;
+    n = Math.floor(n / MANGLE_CHARS.length) - 1;
+  } while (n >= 0);
+  return `$${out}`;
+}
+
+function buildPropMap(js) {
+  const scored = [];
+  for (const key of INTERNAL_PROP_KEYS) {
+    const count = countWord(js, key);
+    if (count > 0) scored.push({ key, count });
+  }
+  scored.sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+  const map = [];
+  for (let i = 0; i < scored.length; i++) map.push([scored[i].key, shortToken(i)]);
+  return map;
+}
+
+function mangleInternalProps(js) {
+  const pairs = buildPropMap(js);
+  let out = js;
+  for (const [from, to] of pairs) {
+    out = out.replace(new RegExp(`\\b${from}\\b`, 'g'), to);
+  }
+  return out;
+}
+
+function aliasCanvasContextCalls(js) {
+  const m = js.match(/([A-Za-z_$][A-Za-z0-9_$]*)=[A-Za-z_$][A-Za-z0-9_$]*\.getContext\("2d"\)/);
+  if (!m) return js;
+  const c = m[1];
+  const aliasPairs = [
+    ['beginPath', 'b'],
+    ['moveTo', 'm'],
+    ['lineTo', 'l'],
+    ['closePath', 'p'],
+    ['stroke', 's'],
+    ['fill', 'f'],
+    ['save', 'v'],
+    ['restore', 'r'],
+    ['arc', 'a'],
+    ['fillRect', 'x'],
+    ['strokeRect', 'y'],
+    ['translate', 't'],
+    ['rotate', 'o'],
+    ['quadraticCurveTo', 'q'],
+    ['createLinearGradient', 'g'],
+    ['setLineDash', 'd'],
+    ['fillText', 'u'],
+    ['measureText', 'w']
+  ];
+  const aliases = aliasPairs.map(([from, to]) => `${c}.${to}=${c}.${from}`).join(',');
+  let out = js.replace(
+    new RegExp(`${c}=([A-Za-z_$][A-Za-z0-9_$]*\\.getContext\\("2d"\\))`),
+    (_, rhs) => `${c}=(${rhs},${aliases},${c})`
+  );
+  for (const [from, to] of aliasPairs) {
+    out = out.replace(new RegExp(`\\b${c}\\.${from}\\(`, 'g'), `${c}.${to}(`);
+  }
+  return out;
+}
+
+function hoistCommonStrings(js) {
+  const pairs = [
+    ['"center"', '_C'],
+    ['"middle"', '_M'],
+    ['"round"', '_R'],
+    ['"monospace"', '_N']
+  ];
+  const decl = [];
+  let out = js;
+  for (const [lit, id] of pairs) {
+    const count = (out.match(new RegExp(lit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    if (count > 2) {
+      out = out.replace(new RegExp(lit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), id);
+      decl.push(`${id}=${lit}`);
+    }
+  }
+  if (!decl.length) return out;
+  return out.replace(/\(\(\)=>\{/, `(()=>{var ${decl.join(',')};`);
+}
+
+function tightenJs(js) {
+  return js
+    .replace(/;{2,}/g, ';')
+    .replace(/,\s*,/g, ',')
+    .replace(/\(\s*\)/g, '()');
+}
+
 function minifyHtmlDoc(doc) {
   return doc
     .replace(/>\s+</g, '><')
@@ -80,12 +206,21 @@ function minifyHtmlDoc(doc) {
 const styleRe = /<style>([\s\S]*?)<\/style>/i;
 const scriptRe = /<script>([\s\S]*?)<\/script>/i;
 
-let built = html;
+let built = stripDevBlocks(html);
 const styleMatch = built.match(styleRe);
-if (styleMatch) built = built.replace(styleRe, `<style>${minifyCss(styleMatch[1])}</style>`);
+if (styleMatch) {
+  const minCss = minifyCss(styleMatch[1]);
+  built = built.replace(styleRe, () => `<style>${minCss}</style>`);
+}
 const scriptMatch = built.match(scriptRe);
 if (scriptMatch) {
-  built = built.replace(scriptRe, `<script>${escapeScriptClose(minifyJsWithBun(scriptMatch[1]))}</script>`);
+  const minJsRaw = minifyJsWithBun(scriptMatch[1]);
+  const minJs = escapeScriptClose(
+    tightenJs(
+      mangleInternalProps(minJsRaw)
+    )
+  );
+  built = built.replace(scriptRe, () => `<script>${minJs}</script>`);
 }
 built = minifyHtmlDoc(built);
 
