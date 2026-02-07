@@ -960,6 +960,7 @@ const WEAPON_INIT_FN={
   chain:s=>initFields(s,{timer:0.1,range:200,chains:4,stunDur:.3,dmg:5,_arcTimer:0,_targets:null}),
   rocket:s=>initFields(s,{timer:0.1,blastR:90,kbForce:250,lastFired:0}),
   mines:s=>initFields(s,{timer:.2,placeCD:2.1,mineLife:7,mineR:48,damage:18,maxMines:3,_mines:[]}),
+  shuriken:s=>initFields(s,{timer:0.1,count:1,markDur:3,markAmp:.3,bounces:2,_shurikens:[]}),
   drone:s=>initFields(s,{timer:0.1,_drones:[],droneCount:1,droneRange:150,silenceDur:1.5}),
 };
 function createWeaponState(id){
@@ -1001,6 +1002,12 @@ const WDATA=[
     ['b','RESERVE RACK',2,['+1 max mine','+2 max mines']],
     ['c','SHOCK FUSE',2,['Leaves short stun field','Longer field + larger radius']],
   ]],
+  ['shuriken','SHURIKEN','#bbb','cc','Bouncing shurikens mark enemies for bonus damage.','MARK',[
+    ['a','EXTRA SHURIKEN',2,['+1','+1 (3 total)']],
+    ['b','DEEP MARK',2,['45% bonus dmg','60%']],
+    ['c','EXT MARK',2,['5s','7s']],
+    ['d','EXTRA BOUNCES',3,['+2 bounces (4)','+2 (6)','+2 (8)']],
+  ]],
   ['drone','PULSE DRONE','#0aa','cc','Drone silences enemies, slows bullets.','SILENCE',[
     ['a','EXTRA DRONE',2,['+1 drone','+1 (3 total)']],
     ['b','EXT SILENCE',2,['2.5s','3.5s']],
@@ -1017,8 +1024,8 @@ for(const w of WDATA){
   WDEFS[w[0]]=d;
 }
 const STARTER_KEYS=['dagger','sword','bow'];
-const CC_KEYS=['chain','rocket','mines','drone'];
-const IMPLEMENTED_CC=['chain','rocket','mines','drone'];
+const CC_KEYS=['chain','rocket','mines','shuriken','drone'];
+const IMPLEMENTED_CC=['chain','rocket','mines','shuriken','drone'];
 
 // Weapon update/draw dispatch
 function updateWeapons(dt){
@@ -1029,6 +1036,7 @@ function updateWeapons(dt){
     else if(w.id==='chain')updateChain(w,dt);
     else if(w.id==='rocket')updateRocket(w,dt);
     else if(w.id==='mines')updateMines(w,dt);
+    else if(w.id==='shuriken')updateShuriken(w,dt);
     else if(w.id==='drone')updateDrone(w,dt);
   }
 }
@@ -1040,6 +1048,7 @@ function drawWeapons(){
     else if(w.id==='chain')drawChain(w);
     else if(w.id==='rocket')drawRocket(w);
     else if(w.id==='mines')drawMines(w);
+    else if(w.id==='shuriken')drawShuriken(w);
     else if(w.id==='drone')drawDrone(w);
   }
 }
@@ -1693,6 +1702,76 @@ function drawDrone(w){
   }
 }
 
+// == SHURIKEN ==
+function updateShuriken(w,dt){
+  const count=w.count+[0,1,2][w.lv.a];
+  const markAmp=[.3,.45,.6][w.lv.b];
+  const markDur=[3,5,7][w.lv.c];
+  const maxBounces=w.bounces+[0,2,2,2][w.lv.d];
+  w.timer-=dt*(1-stats.cdReduction);
+  if(w.timer<=0){
+    w.timer=1.2;
+    for(let n=0;n<count;n++){
+      let best=null,bestD=Infinity;
+      enemies.each(e=>{if(!e.active)return;const d=dist(player.x,player.y,e.x,e.y);
+        const alreadyTarget=w._shurikens.some(s=>s.target===e);
+        if(!alreadyTarget||!best){if(d<bestD){bestD=d;best=e}}
+      });
+      if(!best)break;
+      const a=atan2(best.y-player.y,best.x-player.x);
+      w._shurikens.push({x:player.x,y:player.y,vx:cos(a)*1400,vy:sin(a)*1400,target:best,life:4,markAmp,markDur,angle:0,bouncesLeft:maxBounces,hitSet:new Set()});
+    }
+  }
+  for(let i=w._shurikens.length-1;i>=0;i--){
+    const s=w._shurikens[i];s.life-=dt;s.angle+=dt*12;
+    if(s.life<=0){w._shurikens.splice(i,1);continue}
+    if(s.target&&s.target.active){
+      const desired=atan2(s.target.y-s.y,s.target.x-s.x);
+      const cur=atan2(s.vy,s.vx),diff=normAng(desired-cur),turn=clamp(diff,-12*dt,12*dt);
+      const na=cur+turn,spd=sqrt(s.vx*s.vx+s.vy*s.vy);
+      s.vx=cos(na)*spd;s.vy=sin(na)*spd;
+    }else{
+      let best=null,bestD=Infinity;
+      enemies.each(e=>{if(!e.active||s.hitSet.has(e))return;const d=dist(s.x,s.y,e.x,e.y);if(d<bestD){bestD=d;best=e}});
+      if(best)s.target=best;
+    }
+    s.x+=s.vx*dt;s.y+=s.vy*dt;
+    enemies.each(e=>{if(!e.active||s.hitSet.has(e))return;
+      if(dist(s.x,s.y,e.x,e.y)<e.r+6){
+        s.hitSet.add(e);
+        const bossMult=e.isBoss?.4:1;
+        e.cc.markT=max(e.cc.markT,s.markDur*bossMult);
+        e.cc.markAmp=max(e.cc.markAmp,s.markAmp);
+        dealDamage(e,1,'shuriken');
+        burstParticles(s.x,s.y,'#bbb',5,80);
+        if(s.bouncesLeft>0){
+          s.bouncesLeft--;
+          let next=null,nextD=Infinity;
+          enemies.each(e2=>{if(!e2.active||s.hitSet.has(e2))return;const d=dist(s.x,s.y,e2.x,e2.y);if(d<nextD){nextD=d;next=e2}});
+          if(next){
+            s.target=next;
+            const a=atan2(next.y-s.y,next.x-s.x),spd=sqrt(s.vx*s.vx+s.vy*s.vy);
+            s.vx=cos(a)*spd;s.vy=sin(a)*spd;
+            s.life=max(s.life,2);
+          }else{w._shurikens.splice(i,1)}
+        }else{w._shurikens.splice(i,1)}
+      }
+    });
+  }
+}
+function drawShuriken(w){
+  for(const s of w._shurikens){
+    ctx.save();ctx.translate(s.x,s.y);ctx.rotate(s.angle);
+    ctx.beginPath();
+    for(let i=0;i<4;i++){const a=TAU/4*i;
+      ctx.moveTo(0,0);ctx.lineTo(cos(a)*8,sin(a)*8);ctx.lineTo(cos(a+.4)*4,sin(a+.4)*4);
+    }
+    ctx.strokeStyle='#bbb';ctx.lineWidth=2;ctx.globalAlpha=.8;ctx.stroke();
+    ctx.beginPath();ctx.arc(0,0,2,0,TAU);ctx.fillStyle='#fff';ctx.fill();
+    ctx.restore();
+  }
+}
+
 // == PASSIVES ==
 const PASSIVE_ROWS=[
   ['regen','REGENERATION','#4f4',3,['Heal 1HP/14s','1HP/8s','1HP/8s + emergency heal']],
@@ -1957,12 +2036,14 @@ function dealDamage(e,rawDmg,src,forceCrit){
   if(!e.active)return;
   if(e._dashInvuln>0)return;
   let dmg=rawDmg;
-  if(e.cc.markAmp>0)dmg*=(1+e.cc.markAmp);
+  const isShuriken=src==='shuriken';
+  if(isShuriken)dmg=1;
+  if(!isShuriken&&e.cc.markAmp>0)dmg*=(1+e.cc.markAmp);
   let isCrit=forceCrit||false;
   const critChance=stats.critChance+(G.lucky?.08:0);
-  if(!isCrit&&critChance>0&&Math.random()<critChance){isCrit=true;dmg*=stats.critMult}
-  dmg*=stats.dmgMult;
-  if(e.cc.markT>0)dmg*=(1+e.cc.markAmp);
+  if(!isShuriken&&!isCrit&&critChance>0&&Math.random()<critChance){isCrit=true;dmg*=stats.critMult}
+  if(!isShuriken)dmg*=stats.dmgMult;
+  if(!isShuriken&&e.cc.markT>0)dmg*=(1+e.cc.markAmp);
   // Shield nodes active => boss is invincible until nodes are broken.
   if(e.isBoss&&e.bossAI&&e.bossAI.shieldNodes&&e.bossAI.shieldNodes.some(sn=>sn.hp>0)){
     let target=null,bestHp=1/0,nx=0,ny=0;
@@ -2212,7 +2293,7 @@ function drawHUD(){
     ctx.fillStyle='#0ff';ctx.fillRect(bx,by,bw*p,7);
     drawText('WAVE PROGRESS',CX,by+10,8,'#9cd','center','top');
   }
-  const CD={chain:.8,rocket:2.2,mines:2.1,drone:1.5},sw=52,start=CX-(max(1,G.weapons.length)*sw)/2+sw/2;
+  const CD={chain:.8,rocket:2.2,mines:2.1,shuriken:1.2,drone:1.5},sw=52,start=CX-(max(1,G.weapons.length)*sw)/2+sw/2;
   for(let i=0;i<G.weapons.length;i++){
     const w=G.weapons[i],d=WDEFS[w.id],x=start+i*sw,y=H-46;
     drawPanel(x-18,y-12,36,24,'rgba(0,0,0,.5)',d.color,1);
