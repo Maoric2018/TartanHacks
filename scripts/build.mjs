@@ -72,11 +72,50 @@ function minifyJsWithBun(js) {
   return minifyJs(js);
 }
 
+function minifyJsWithTerser(js) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neon-terser-'));
+  const inPath = path.join(tmpDir, 'in.js');
+  const outPath = path.join(tmpDir, 'out.js');
+  fs.writeFileSync(inPath, js);
+  try {
+    execFileSync('bunx', [
+      'terser',
+      inPath,
+      '-c',
+      'passes=3,ecma=2020,toplevel,unsafe_arrows,unsafe_math,unsafe_methods,booleans_as_integers',
+      '-m',
+      'toplevel',
+      '-o',
+      outPath
+    ], { stdio: 'pipe' });
+    if (fs.existsSync(outPath)) {
+      const out = fs.readFileSync(outPath, 'utf8').trim();
+      if (out) return out;
+    }
+  } catch {
+    return js;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+  return js;
+}
+
 function escapeScriptClose(js) {
   return js.replace(/<\/script>/gi, '<\\/script>');
 }
 
 const INTERNAL_PROP_KEYS = [
+  'active', 'alive', 'angle', 'baseSpeed', 'bleedDmg', 'bleedT', 'bossFx', 'bossFxFreq',
+  'bossFxPhase', 'bossFxPower', 'bossFxSpin', 'bossHomingStop', 'bossHomingTurn',
+  'bossWindX', 'bossWindY', 'button', 'charging', 'count', 'curve', 'damage', 'dashT',
+  'dashTx', 'dashTy', 'decay', 'desc', 'dmgCD', 'echo', 'echoed', 'echoTimer', 'enraged',
+  'fearT', 'freq', 'hitSet', 'invuln', 'kbVx', 'kbVy', 'life', 'lineCap', 'loopAmp',
+  'loopBaseAng', 'loopFreq', 'markAmp', 'markT', 'maxLife', 'maxT', 'name', 'offset',
+  'owner', 'phase', 'pierce', 'playerHP', 'pulseAmp', 'pulseFreq', 'pulseT', 'radius',
+  'reflected', 'refreshAvailable', 'rootT', 'shape', 'shieldCD', 'shotCD', 'silenceT',
+  'slowAmt', 'slowT', 'spawn', 'speed', 'split', 'src', 'state', 'stunT', 'target',
+  'teleT', 'tier', 'time', 'timer', 'type', 'warn', 'warnColor', 'waitTime', 'wdef',
+  'wave', 'weapons', 'width', 'color', 'mods',
   'moveParams', 'spawnTime', 'bossEntity', 'waveState', 'bannerTimer', 'killFlash',
   'swordIFrame', 'pulseSpeed', 'difficulty', 'shieldNodes', 'bossAI', 'isBoss',
   'firePattern', 'fireTimer', 'fireCD', 'maxLife', 'maxHp', 'hitFlash', 'moveType',
@@ -115,7 +154,7 @@ function shortToken(i) {
 
 function buildPropMap(js) {
   const scored = [];
-  for (const key of INTERNAL_PROP_KEYS) {
+  for (const key of new Set(INTERNAL_PROP_KEYS)) {
     const count = countWord(js, key);
     if (count > 0) scored.push({ key, count });
   }
@@ -135,7 +174,7 @@ function mangleInternalProps(js) {
 }
 
 function aliasCanvasContextCalls(js) {
-  const m = js.match(/([A-Za-z_$][A-Za-z0-9_$]*)=[A-Za-z_$][A-Za-z0-9_$]*\.getContext\("2d"\)/);
+  const m = js.match(/([A-Za-z_$][A-Za-z0-9_$]*)=[A-Za-z_$][A-Za-z0-9_$]*\.getContext\((?:"2d"|'2d')\)/);
   if (!m) return js;
   const c = m[1];
   const aliasPairs = [
@@ -160,7 +199,7 @@ function aliasCanvasContextCalls(js) {
   ];
   const aliases = aliasPairs.map(([from, to]) => `${c}.${to}=${c}.${from}`).join(',');
   let out = js.replace(
-    new RegExp(`${c}=([A-Za-z_$][A-Za-z0-9_$]*\\.getContext\\("2d"\\))`),
+    new RegExp(`${c}=([A-Za-z_$][A-Za-z0-9_$]*\\.getContext\\((?:\\"2d\\"|'2d')\\))`),
     (_, rhs) => `${c}=(${rhs},${aliases},${c})`
   );
   for (const [from, to] of aliasPairs) {
@@ -215,10 +254,14 @@ if (styleMatch) {
 const scriptMatch = built.match(scriptRe);
 if (scriptMatch) {
   const minJsRaw = minifyJsWithBun(scriptMatch[1]);
-  const minJs = escapeScriptClose(
+  const minJsPass2 = minifyJsWithBun(minJsRaw);
+  const minJsTerser = minifyJsWithTerser(
     tightenJs(
-      mangleInternalProps(minJsRaw)
+      hoistCommonStrings(minJsPass2)
     )
+  );
+  const minJs = escapeScriptClose(
+    tightenJs(minJsTerser)
   );
   built = built.replace(scriptRe, () => `<script>${minJs}</script>`);
 }
